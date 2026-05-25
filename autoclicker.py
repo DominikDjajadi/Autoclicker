@@ -5,6 +5,7 @@ import typing
 import threading
 
 pyautogui.FAILSAFE = True
+pyautogui.PAUSE = 0
 HOTKEY = "F1"
 
 def click():

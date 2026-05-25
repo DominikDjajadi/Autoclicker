@@ -2,6 +2,8 @@ import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+import pyautogui
+
 import autoclicker
 import recorder
 from macro_editor import MacroEditor
@@ -11,7 +13,11 @@ class AutoclickerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Autoclicker")
-        self.root.resizable(False, False)
+        self.root.geometry("480x620")
+        self.root.minsize(420, 560)
+        self.root.resizable(True, True)
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
 
         self._click_stop = threading.Event()
         self._click_thread: threading.Thread | None = None
@@ -20,6 +26,14 @@ class AutoclickerApp:
         self._recorded_events: list[dict] = []
         self._play_stop = threading.Event()
         self._play_thread: threading.Thread | None = None
+        self._minimized_for_task = False
+        self._play_skip_count = 0
+        self._failsafe_stopped = False
+        self._playback_user_stop = False
+        self._play_hotkey = recorder.GlobalHotkeyListener(
+            recorder.STOP_PLAYBACK_KEY,
+            self._request_stop_playback,
+        )
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -29,6 +43,7 @@ class AutoclickerApp:
 
         main = ttk.Frame(self.root, padding=16)
         main.grid(row=0, column=0, sticky="nsew")
+        main.columnconfigure(1, weight=1)
 
         ttk.Label(main, text="Click interval (seconds)").grid(
             row=0, column=0, columnspan=2, sticky="w", **padding
@@ -80,7 +95,7 @@ class AutoclickerApp:
         ttk.Label(main, text="Name").grid(row=6, column=0, sticky="w", **padding)
         self.macro_name_var = tk.StringVar(value="")
         self.macro_name_entry = ttk.Entry(main, textvariable=self.macro_name_var, width=28)
-        self.macro_name_entry.grid(row=6, column=1, sticky="w", **padding)
+        self.macro_name_entry.grid(row=6, column=1, sticky="ew", **padding)
 
         macro_record_row = ttk.Frame(main)
         macro_record_row.grid(row=7, column=0, columnspan=2, **padding)
@@ -109,7 +124,7 @@ class AutoclickerApp:
         self.macro_combo = ttk.Combobox(
             main, textvariable=self.macro_list_var, state="readonly", width=26
         )
-        self.macro_combo.grid(row=8, column=1, sticky="w", **padding)
+        self.macro_combo.grid(row=8, column=1, sticky="ew", **padding)
         self.macro_combo.bind("<<ComboboxSelected>>", self._on_macro_selected)
         self._refresh_macro_list()
 
@@ -136,22 +151,53 @@ class AutoclickerApp:
         self.edit_macro_btn.grid(row=0, column=2)
 
         self.macro_status_var = tk.StringVar(
-            value="Enter a name, then Record. Press F2 to stop."
+            value="Enter a name, then Record. Press F2 to stop play/record."
         )
-        ttk.Label(main, textvariable=self.macro_status_var, wraplength=320).grid(
-            row=10, column=0, columnspan=2, sticky="w", **padding
+        self.macro_status_label = ttk.Label(main, textvariable=self.macro_status_var)
+        self.macro_status_label.grid(
+            row=10, column=0, columnspan=2, sticky="ew", **padding
         )
 
         ttk.Separator(main, orient="horizontal").grid(
             row=11, column=0, columnspan=2, sticky="ew", pady=(4, 8)
         )
 
-        ttk.Label(
+        self.minimize_when_running_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            main,
+            text="Minimize window when running (clicker, macro, record)",
+            variable=self.minimize_when_running_var,
+        ).grid(row=12, column=0, columnspan=2, sticky="w", **padding)
+
+        self.failsafe_label = ttk.Label(
             main,
             text="Move the mouse to any screen corner to trigger PyAutoGUI failsafe.",
-            wraplength=320,
             foreground="gray",
-        ).grid(row=12, column=0, columnspan=2, sticky="w", **padding)
+        )
+        self.failsafe_label.grid(row=13, column=0, columnspan=2, sticky="ew", **padding)
+
+        for label in (self.macro_status_label, self.failsafe_label):
+            label.bind("<Configure>", self._update_label_wrap)
+
+    def _update_label_wrap(self, event: tk.Event) -> None:
+        widget = event.widget
+        if isinstance(widget, ttk.Label):
+            widget.config(wraplength=max(event.width - 8, 200))
+
+    def _minimize_for_task(self) -> None:
+        if self.minimize_when_running_var.get() and self.root.state() != "iconic":
+            self._minimized_for_task = True
+            self.root.update_idletasks()
+            self.root.iconify()
+        else:
+            self._minimized_for_task = False
+
+    def _restore_window(self) -> None:
+        if self._minimized_for_task:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+            self._minimized_for_task = False
 
     def _update_cps_label(self, *_args) -> None:
         try:
@@ -203,6 +249,7 @@ class AutoclickerApp:
         self.status_var.set(f"Running — every {interval:.2f}s")
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
+        self.root.after(150, self._minimize_for_task)
 
     def stop_clicking(self) -> None:
         self._click_stop.set()
@@ -210,6 +257,7 @@ class AutoclickerApp:
             self._click_thread.join(timeout=2)
             self._click_thread = None
 
+        self._restore_window()
         self.status_var.set("Stopped")
         self.start_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
@@ -264,13 +312,10 @@ class AutoclickerApp:
         self.save_macro_btn.config(state="disabled")
         self._set_recording_ui(True)
         self.macro_status_var.set("Starting… window will minimize. Press F2 to stop.")
-        self.root.update_idletasks()
-        self.root.iconify()
+        self.root.after(150, self._minimize_for_task)
         self.root.after(300, self._begin_recording)
 
     def _begin_recording(self) -> None:
-        if self.root.state() != "iconic":
-            self.root.iconify()
         self._macro_recorder.start()
         name = self.macro_name_var.get().strip()
         self.macro_status_var.set(f'Recording "{name}"… press F2 to stop.')
@@ -280,11 +325,6 @@ class AutoclickerApp:
             return
         self._recorded_events = self._macro_recorder.stop()
         self._finish_recording()
-
-    def _restore_window(self) -> None:
-        self.root.deiconify()
-        self.root.lift()
-        self.root.focus_force()
 
     def _on_macro_record_stopped(self) -> None:
         self.root.after(0, self._handle_hotkey_stop)
@@ -296,6 +336,7 @@ class AutoclickerApp:
 
     def _finish_recording(self) -> None:
         self._restore_window()
+        self._recorded_events = recorder.expand_step_delays(self._recorded_events)
         count = len(self._recorded_events)
         name = self.macro_name_var.get().strip()
         self._set_recording_ui(False)
@@ -324,18 +365,55 @@ class AutoclickerApp:
         self.macro_list_var.set(path.stem)
         self.macro_status_var.set(f'Saved "{path.stem}" ({len(self._recorded_events)} events).')
 
+    def _request_stop_playback(self) -> None:
+        self.root.after(0, self._hotkey_stop_playback)
+
+    def _hotkey_stop_playback(self) -> None:
+        if self._play_thread and self._play_thread.is_alive():
+            self._playback_user_stop = True
+            self._play_stop.set()
+
+    def _start_playback_hotkey(self) -> None:
+        self._play_hotkey.start()
+
+    def _stop_playback_hotkey(self) -> None:
+        self._play_hotkey.stop()
+
     def _play_loop(self, events: list[dict]) -> None:
+        self._play_skip_count = 0
+        self._failsafe_stopped = False
+
+        def on_error(step: dict, exc: Exception) -> None:
+            self._play_skip_count += 1
+
         try:
-            recorder.play_macro(events, self._play_stop)
+            recorder.play_macro(events, self._play_stop, on_error=on_error)
+        except pyautogui.FailSafeException:
+            self._failsafe_stopped = True
+            self._play_stop.set()
         finally:
             self.root.after(0, self._on_play_finished)
 
     def _on_play_finished(self) -> None:
+        self._stop_playback_hotkey()
+        self._restore_window()
         self._play_thread = None
         self.play_macro_btn.config(state="normal")
         self.stop_play_btn.config(state="disabled")
-        if self._play_stop.is_set():
-            self.macro_status_var.set("Playback stopped.")
+        if self._failsafe_stopped:
+            self.macro_status_var.set("Stopped by failsafe (mouse in screen corner).")
+            self._failsafe_stopped = False
+        elif self._play_stop.is_set():
+            if self._playback_user_stop:
+                self.macro_status_var.set("Playback stopped (F2 or Stop Play).")
+            else:
+                self.macro_status_var.set(
+                    "Playback stopped early (not F2 — likely a non-skippable error)."
+                )
+        elif self._play_skip_count:
+            self.macro_status_var.set(
+                f"Finished with {self._play_skip_count} skipped step(s)."
+            )
         else:
             self.macro_status_var.set("Playback finished.")
 
@@ -365,13 +443,16 @@ class AutoclickerApp:
             return
 
         self._play_stop.clear()
+        self._playback_user_stop = False
+        self._start_playback_hotkey()
         self._play_thread = threading.Thread(
             target=self._play_loop, args=(events,), daemon=True
         )
         self._play_thread.start()
         self.play_macro_btn.config(state="disabled")
         self.stop_play_btn.config(state="normal")
-        self.macro_status_var.set("Playing macro…")
+        self.macro_status_var.set("Playing macro… press F2 to stop.")
+        self.root.after(150, self._minimize_for_task)
 
     def open_macro_editor(self) -> None:
         macro_name = self.macro_name_var.get().strip() or "my_macro"
@@ -404,11 +485,15 @@ class AutoclickerApp:
         self.macro_status_var.set(f'Loaded editor changes for "{name}" ({len(steps)} steps).')
 
     def stop_playing(self) -> None:
+        self._playback_user_stop = True
         self._play_stop.set()
+        self._restore_window()
         if self._play_thread:
             self._play_thread.join(timeout=2)
+        self._stop_playback_hotkey()
 
     def _on_close(self) -> None:
+        self._stop_playback_hotkey()
         self.stop_clicking()
         if self._macro_recorder.is_recording:
             self._macro_recorder.stop()
