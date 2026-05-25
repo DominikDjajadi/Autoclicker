@@ -1,0 +1,4 @@
+macros/*
+images/*
+__pycache__/
+*.json
